@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+<?import javafx.scene.text.Font?>
+<?import javafx.scene.control.cell.ComboBoxListCell?>
+
+
+<VBox alignment="CENTER" spacing="10.0" xmlns="http://javafx.com/javafx/17" xmlns:fx="http://javafx.com/fxml/1" fx:controller="com.somnath.ui.ChatController">
+    <padding>
+        <Insets bottom="20.0" left="20.0" right="20.0" top="20.0" />
+    </padding>
+
+    <Label text="Encrypted Chat with Hamming" wrapText="true" textAlignment="CENTER">
+        <font>
+            <Font name="System Bold" size="18.0" />
+        </font>
+    </Label>
+
+    <!-- Status Label -->
+    <Label fx:id="statusLabel" text="Status: Not Connected" textFill="#65ff19"/>
+
+    <!-- Message Display Area -->
+    <!-- ListView to show messages, will use a custom cell factory -->
+    <ListView fx:id="messageListView" VBox.vgrow="ALWAYS">
+    </ListView>
+
+    <!-- Input Area -->
+    <HBox spacing="5.0">
+        <TextField fx:id="messageTextField" HBox.hgrow="ALWAYS" promptText="Enter message..."/>
+        <Button fx:id="sendButton" text="Send"/>
+    </HBox>
+
+</VBox>

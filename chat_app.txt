@@ -1,0 +1,1328 @@
+--- pom.xml ---
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.somnath</groupId>
+    <artifactId>chat_app</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <javafx.version>17.0.2</javafx.version>
+    </properties>
+
+    <dependencies>
+        <!-- JavaFX Controls Module -->
+        <dependency>
+            <groupId>org.openjfx</groupId>
+            <artifactId>javafx-controls</artifactId>
+            <version>${javafx.version}</version> <!-- Use the version property -->
+        </dependency>
+
+        <!-- JavaFX FXML Module -->
+        <dependency>
+            <groupId>org.openjfx</groupId>
+            <artifactId>javafx-fxml</artifactId>
+            <version>${javafx.version}</version> <!-- Use the version property -->
+        </dependency>
+
+        <!-- Add other dependencies here if needed later -->
+
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.8.1</version>
+                <configuration>
+                    <source>${maven.compiler.source}</source>
+                    <target>${maven.compiler.target}</target>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+
+
+</project>
+
+--- src\main\java\com\somnath\AppLauncher.java ---
+package com.somnath;// AppLauncher.java
+import com.somnath.ui.ChatController; // Import the controller
+
+import javafx.application.Application;
+import javafx.application.Platform;
+import javafx.fxml.FXMLLoader;
+import javafx.scene.Parent;
+import javafx.scene.Scene;
+import javafx.stage.Stage;
+
+import java.io.IOException;
+
+public class AppLauncher extends Application {
+
+    private ChatController chatController; // Keep a reference to the controller
+
+    @Override
+    public void start(Stage primaryStage) throws IOException {
+        FXMLLoader loader = new FXMLLoader(getClass().getResource("/ui/ChatWindow.fxml")); // Use / for resource root
+        Parent root = loader.load(); // This also initializes the ChatController
+        chatController = loader.getController(); // Get the controller instance
+
+        primaryStage.setTitle("Encrypted Chat App");
+        primaryStage.setScene(new Scene(root));
+        primaryStage.show();
+
+        // Handle window close
+        primaryStage.setOnCloseRequest(event -> {
+            // Properly shut down the client connection
+            if (chatController != null && chatController.client != null) {
+                chatController.client.closeClient();
+            }
+            Platform.exit(); // Exit JavaFX application
+            System.exit(0); // Exit the whole application
+        });
+    }
+
+    public static void main(String[] args) {
+        launch(args); // Launches the JavaFX application
+    }
+}
+
+--- src\main\java\com\somnath\client\Client.java ---
+package com.somnath.client;
+
+import com.somnath.common.Message;
+import com.somnath.common.RSAUtil;
+import com.somnath.common.HammingUtil;
+import com.somnath.ui.ChatController;
+
+import java.io.*;
+import java.net.*;
+import java.security.PublicKey;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+
+public class Client {
+
+    private String host;
+    private int port;
+    public Socket socket; // Made public for the UI controller to check state
+    private ObjectInputStream inputStream;
+    private ObjectOutputStream outputStream;
+    private PublicKey serverPublicKey;
+    private String username;
+    private ChatController controller;
+
+    // Regex to parse @username <message>
+    // Captures username in group 1, message in group 2
+    private static final Pattern PRIVATE_MESSAGE_PATTERN = Pattern.compile("^@(\\w+)\\s+(.*)");
+
+
+    public Client(String host, int port, String username, ChatController controller) {
+        this.host = host;
+        this.port = port;
+        this.username = username;
+        this.controller = controller;
+    }
+
+    public void startClient() {
+        try {
+            // 1. Connect to Server
+            socket = new Socket(host, port);
+            System.out.println("Connected to server: " + socket);
+
+            // Initialize streams (Output first to avoid deadlock)
+            outputStream = new ObjectOutputStream(socket.getOutputStream());
+            inputStream = new ObjectInputStream(socket.getInputStream());
+
+            // 2. Receive Server's Public Key
+            serverPublicKey = (PublicKey) inputStream.readObject();
+            System.out.println("Received server public key.");
+
+            // 3. Send Client's Username to Server
+            outputStream.writeObject(username);
+            outputStream.flush();
+            System.out.println("Sent username '" + username + "' to server.");
+
+            // Server might deny the connection if username is taken.
+            // We need to wait for a response or assume success if no immediate error.
+            // A more robust approach would be for the server to send a success/failure confirmation object.
+            // For this implementation, we'll proceed assuming success unless disconnected.
+
+            // 4. Start a thread to listen for incoming messages
+            new Thread(this::listenForMessages).start();
+
+        } catch (ConnectException e) {
+            System.err.println("Connection refused. Is the server running?");
+            controller.displayStatus("Connection failed: Server refused connection.");
+        } catch (UnknownHostException e) {
+            System.err.println("Unknown host: " + host);
+            controller.displayStatus("Connection failed: Unknown host.");
+        } catch (IOException e) {
+            System.err.println("IO error during connection setup: " + e.getMessage());
+            e.printStackTrace();
+            controller.displayStatus("Connection failed: IO Error. See console.");
+        } catch (ClassNotFoundException e) {
+            System.err.println("Received unexpected data from server during key exchange: " + e.getMessage());
+            e.printStackTrace();
+            controller.displayStatus("Connection failed: Protocol Error. See console.");
+        }
+    }
+
+    // Thread method to continuously listen for messages from the server
+    private void listenForMessages() {
+        try {
+            Object receivedObject;
+            while (socket.isConnected() && (receivedObject = inputStream.readObject()) != null) {
+                // Server sends back the processed Message object
+                if (receivedObject instanceof Message) {
+                    Message receivedMessage = (Message) receivedObject;
+                    // Pass the complete message object to the UI controller for display.
+                    // The UI will decide how to render it based on its fields (sender, recipient, etc.)
+                    System.out.println("Client received message object. Final Text: '" + receivedMessage.getFinalDecryptedContent() + "'");
+                    controller.displayMessage(receivedMessage); // Update the UI
+                } else {
+                    System.err.println("Received unexpected object type from server: " + receivedObject.getClass().getName());
+                }
+            }
+        } catch (SocketException e) {
+            System.out.println("Disconnected from server (SocketException).");
+            controller.displayStatus("Disconnected from server.");
+        } catch (EOFException e) {
+            System.out.println("Disconnected from server (EOFException).");
+            controller.displayStatus("Disconnected from server.");
+        } catch (IOException e) {
+            System.err.println("IO error while listening for messages: " + e.getMessage());
+            e.printStackTrace();
+            controller.displayStatus("Error receiving message. See console.");
+        } catch (ClassNotFoundException e) {
+            System.err.println("Received unknown object from server: " + e.getMessage());
+            e.printStackTrace();
+            controller.displayStatus("Error processing received data. See console.");
+        } finally {
+            closeClient(); // Clean up resources
+        }
+    }
+
+    // Method to send a message from the client UI
+    public void sendMessage(String fullOriginalText) {
+        if (socket == null || !socket.isConnected() || outputStream == null || serverPublicKey == null) {
+            System.err.println("Not connected to server or server public key not received.");
+            controller.displayStatus("Cannot send: Not connected or no server key.");
+            return;
+        }
+
+        String recipient = null;
+        String contentToEncrypt = fullOriginalText.trim(); // Default: group message, full text is content
+
+        // --- Parse for Private Message Syntax ---
+        Matcher matcher = PRIVATE_MESSAGE_PATTERN.matcher(fullOriginalText.trim());
+        if (matcher.matches()) {
+            recipient = matcher.group(1); // The username after '@'
+            contentToEncrypt = matcher.group(2).trim(); // The message body after the username
+            System.out.println("Parsed as Private Message: Recipient='" + recipient + "', Content='" + contentToEncrypt + "'");
+        } else {
+            System.out.println("Parsed as Group Message: Content='" + contentToEncrypt + "'");
+        }
+
+        // Don't send empty content
+        if (contentToEncrypt.isEmpty()) {
+            System.out.println("Message content is empty after parsing. Not sending.");
+            return;
+        }
+
+
+        try {
+            // 1. Create Message object
+            Message messageToSend = new Message(this.username, fullOriginalText.trim(), recipient, contentToEncrypt);
+
+            // 2. RSA Encrypt the actual message content using server's public key
+            byte[] contentBytes = RSAUtil.stringToBytes(contentToEncrypt);
+            byte[] encryptedBytes = RSAUtil.encrypt(contentBytes, serverPublicKey);
+            String encryptedBase64 = RSAUtil.bytesToBase64(encryptedBytes);
+            messageToSend.setEncryptedContentBase64(encryptedBase64);
+            // System.out.println("Encrypted Content (Base64): " + encryptedBase64); // Too verbose
+
+            // 3. Convert encrypted bytes to binary string
+            String encryptedBinary = HammingUtil.bytesToBinaryString(encryptedBytes);
+
+            // 4. Hamming Encode the encrypted binary string
+            String hammingEncoded = HammingUtil.encode(encryptedBinary);
+            messageToSend.setHammingEncodedBinary(hammingEncoded);
+            // System.out.println("Hamming Encoded (Binary): " + hammingEncoded); // Too verbose
+
+
+            // 5. Simulate a 1-bit error in the Hamming Encoded binary string
+            String erroredHamming = HammingUtil.simulateError(hammingEncoded);
+            messageToSend.setErroredHammingBinary(erroredHamming);
+            // System.out.println("Errored Hamming (Binary): " + erroredHamming); // Too verbose
+            // System.out.println("Error simulated at index (within Hamming string): " + findFirstDifference(hammingEncoded, erroredHamming)); // Helper for debugging
+
+
+            // 6. Send the Message object to the server
+            // The server will receive the object containing:
+            // sender, fullOriginalText, recipient, contentToEncrypt, encryptedContentBase64, hammingEncodedBinary, erroredHammingBinary
+            // The server will then populate correctedHammingBinary, finalDecryptedContent, error flags
+            // and route the full object back to relevant clients.
+            outputStream.writeObject(messageToSend);
+            outputStream.flush(); // Send the message immediately
+            System.out.println("Message object sent to server.");
+
+
+        } catch (Exception e) {
+            System.err.println("Error sending message: " + e.getMessage());
+            e.printStackTrace();
+            controller.displayStatus("Error sending message. See console.");
+        }
+    }
+
+    // Simple helper to find the index of the first difference (for debugging error simulation)
+    private int findFirstDifference(String s1, String s2) {
+        int minLength = Math.min(s1.length(), s2.length());
+        for (int i = 0; i < minLength; i++) {
+            if (s1.charAt(i) != s2.charAt(i)) {
+                return i;
+            }
+        }
+        if (s1.length() != s2.length()) return minLength;
+        return -1; // No difference
+    }
+
+
+    // Clean up client resources
+    public void closeClient() {
+        try {
+            if (inputStream != null) inputStream.close();
+            if (outputStream != null) outputStream.close();
+            if (socket != null && !socket.isClosed()) socket.close();
+            System.out.println("Client connection closed.");
+        } catch (IOException e) {
+            System.err.println("Error closing client: " + e.getMessage());
+        }
+    }
+
+    // Getter for username (needed by ChatController)
+    public String getUsername() {
+        return username;
+    }
+}
+
+--- src\main\java\com\somnath\common\HammingUtil.java ---
+package com.somnath.common;
+
+import java.util.Random;
+
+public class HammingUtil {
+
+    private static final Random random = new Random();
+
+    /**
+     * Converts a byte array into a binary string (padded to 8 bits per byte).
+     */
+    public static String bytesToBinaryString(byte[] bytes) {
+        StringBuilder binary = new StringBuilder();
+        for (byte b : bytes) {
+            int val = b;
+            for (int i = 0; i < 8; i++) {
+                binary.append((val & 128) == 0 ? 0 : 1);
+                val <<= 1;
+            }
+        }
+        return binary.toString();
+    }
+
+    /**
+     * Converts a binary string back into a byte array.
+     * Assumes the binary string length is a multiple of 8.
+     */
+    public static byte[] binaryStringToBytes(String binaryString) {
+        if (binaryString.length() % 8 != 0) {
+            throw new IllegalArgumentException("Binary string length must be a multiple of 8.");
+        }
+        byte[] bytes = new byte[binaryString.length() / 8];
+        for (int i = 0; i < bytes.length; i++) {
+            int byteValue = 0;
+            for (int j = 0; j < 8; j++) {
+                byteValue = (byteValue << 1) | (binaryString.charAt(i * 8 + j) - '0');
+            }
+            bytes[i] = (byte) byteValue;
+        }
+        return bytes;
+    }
+
+    /**
+     * Encodes a binary string using Hamming(7,4).
+     * Pads the input binary string with '0's if its length is not a multiple of 4.
+     * Operates on 4-bit blocks. Output is 7-bit blocks.
+     */
+    public static String encode(String binaryInput) {
+        // Pad input to be a multiple of 4 bits
+        int paddingNeeded = (4 - (binaryInput.length() % 4)) % 4;
+        String paddedInput = binaryInput + "0".repeat(paddingNeeded);
+
+        StringBuilder encodedBinary = new StringBuilder();
+        for (int i = 0; i < paddedInput.length(); i += 4) {
+            String dataBlock = paddedInput.substring(i, i + 4);
+            // dataBlock is d3 d2 d1 d0 (e.g., "1101") -> d3=1, d2=1, d1=0, d0=1
+
+            int d0 = dataBlock.charAt(3) - '0';
+            int d1 = dataBlock.charAt(2) - '0';
+            int d2 = dataBlock.charAt(1) - '0';
+            int d3 = dataBlock.charAt(0) - '0';
+
+            // Calculate parity bits (p0, p1, p2) for Hamming(7,4)
+            // p0 covers bits 1, 2, 4, 5 (in encoded string, indices 0, 1, 3, 4) -> d0, d1, d3
+            // p1 covers bits 1, 2, 3, 6 (in encoded string, indices 0, 1, 2, 5) -> d0, d2, d3
+            // p2 covers bits 4, 5, 6, 7 (in encoded string, indices 3, 4, 5, 6) -> d0, d1, d2
+            // Parity bit indices in the 7-bit block: p0 at index 0, p1 at index 1, p2 at index 2
+            // Data bit indices: d0 at 6, d1 at 5, d2 at 4, d3 at 3 (common layout is p0 p1 p2 d3 d2 d1 d0)
+
+            // Recalculate parity based on bit positions in the *encoded* word:
+            // p0 (bit 1): d0, d1, d3 (bits 7, 5, 3)
+            // p1 (bit 2): d0, d2, d3 (bits 7, 6, 3)
+            // p2 (bit 4): d1, d2, d3 (bits 5, 6, 3)
+
+            int p0 = d0 ^ d1 ^ d3;
+            int p1 = d0 ^ d2 ^ d3;
+            int p2 = d1 ^ d2 ^ d3;
+
+            // Encoded word structure: p0 p1 p2 d3 d2 d1 d0
+            encodedBinary.append(p0).append(p1).append(p2).append(d3).append(d2).append(d1).append(d0);
+        }
+        return encodedBinary.toString();
+    }
+
+
+    /**
+     * Decodes a Hamming(7,4) binary string.
+     * Assumes the input binary string is corrected and its length is a multiple of 7.
+     * Extracts the original 4-bit blocks.
+     */
+    public static String decode(String correctedBinaryInput) {
+        if (correctedBinaryInput.length() % 7 != 0) {
+            // This shouldn't happen if correction output is always multiple of 7
+            System.err.println("Hamming decode input length not a multiple of 7!");
+            // Attempt to truncate to nearest multiple? Or throw? Let's throw.
+            throw new IllegalArgumentException("Corrected binary string length must be a multiple of 7.");
+        }
+
+        StringBuilder decodedBinary = new StringBuilder();
+        for (int i = 0; i < correctedBinaryInput.length(); i += 7) {
+            String encodedBlock = correctedBinaryInput.substring(i, i + 7);
+            // encodedBlock is p0 p1 p2 d3 d2 d1 d0 (e.g., "0111011")
+            // Indices:         0  1  2  3  4  5  6
+
+            // Extract data bits
+            char d3 = encodedBlock.charAt(3);
+            char d2 = encodedBlock.charAt(4);
+            char d1 = encodedBlock.charAt(5);
+            char d0 = encodedBlock.charAt(6);
+
+            decodedBinary.append(d3).append(d2).append(d1).append(d0);
+        }
+        // Note: This output binary string might have padding '0's added during encode.
+        // These '0's will remain and need to be handled when converting back to original type if necessary.
+        // For this app, we convert this binary back to bytes, then String, so padding '0's at the end of the
+        // original String's byte representation will be harmless.
+        return decodedBinary.toString();
+    }
+
+
+    /**
+     * Simulates a single-bit error in a binary string.
+     * Selects a random bit and flips it.
+     * @return The binary string with one bit flipped.
+     */
+    public static String simulateError(String binaryInput) {
+        if (binaryInput == null || binaryInput.isEmpty()) {
+            return binaryInput;
+        }
+        StringBuilder errored = new StringBuilder(binaryInput);
+        int randomIndex = random.nextInt(errored.length());
+        char flippedBit = (errored.charAt(randomIndex) == '0') ? '1' : '0';
+        errored.setCharAt(randomIndex, flippedBit);
+        return errored.toString();
+    }
+
+    /**
+     * Corrects a single-bit error in a Hamming(7,4) binary string.
+     * Assumes the input length is a multiple of 7.
+     * Returns the corrected binary string.
+     * Also returns the error syndrome (0 means no error, >0 is error position).
+     * Note: This implementation returns the *corrected* string and side-effects the boolean flags.
+     * A better design might return an object with corrected string + syndrome.
+     * For this app, we can pass the Message object and set flags.
+     * @param erroredBinaryInput The binary string with potential error.
+     * @param message The Message object to update error flags.
+     * @return The corrected binary string.
+     */
+    public static String correctError(String erroredBinaryInput, Message message) {
+        if (erroredBinaryInput.length() % 7 != 0) {
+            System.err.println("Hamming correct input length not a multiple of 7!");
+            // Cannot correct if length is wrong. Return as is or throw?
+            // Let's return as is for now, won't be correctable/decodable later.
+            message.setErrorDetected(false); // Cannot even check
+            message.setErrorCorrected(false);
+            return erroredBinaryInput;
+        }
+
+        StringBuilder correctedBinary = new StringBuilder(erroredBinaryInput);
+        boolean errorDetectedInBlock = false;
+
+        for (int i = 0; i < erroredBinaryInput.length(); i += 7) {
+            String block = erroredBinaryInput.substring(i, i + 7);
+            // Block is p0 p1 p2 d3 d2 d1 d0
+            // Indices:         0  1  2  3  4  5  6
+
+            // Recalculate parity based on the received block
+            int r_p0 = block.charAt(0) - '0'; // Received p0
+            int r_p1 = block.charAt(1) - '0'; // Received p1
+            int r_p2 = block.charAt(2) - '0'; // Received p2
+
+            int r_d3 = block.charAt(3) - '0';
+            int r_d2 = block.charAt(4) - '0';
+            int r_d1 = block.charAt(5) - '0';
+            int r_d0 = block.charAt(6) - '0';
+
+            // Calculate syndrome bits s0, s1, s2
+            // s0 = p0 ^ d0 ^ d1 ^ d3
+            // s1 = p1 ^ d0 ^ d2 ^ d3
+            // s2 = p2 ^ d1 ^ d2 ^ d3
+            int s0 = r_p0 ^ r_d0 ^ r_d1 ^ r_d3;
+            int s1 = r_p1 ^ r_d0 ^ r_d2 ^ r_d3;
+            int s2 = r_p2 ^ r_d1 ^ r_d2 ^ r_d3;
+
+            // Syndrome word: s2 s1 s0 (binary representation of error position)
+            int syndrome = (s2 << 2) | (s1 << 1) | s0;
+
+            if (syndrome != 0) {
+                // Syndrome value corresponds to the 1-based index of the error bit.
+                // For example, syndrome 1 means bit 1 (p0) is wrong, syndrome 7 means bit 7 (d0) is wrong.
+                // We need to convert this 1-based index (1-7) to a 0-based index within the block (0-6).
+                int errorIndexInBlock = syndrome - 1;
+
+                // Flip the bit at the error position within this block
+                int globalErrorIndex = i + errorIndexInBlock;
+                char oldBit = correctedBinary.charAt(globalErrorIndex);
+                char newBit = (oldBit == '0') ? '1' : '0';
+                correctedBinary.setCharAt(globalErrorIndex, newBit);
+
+                errorDetectedInBlock = true;
+            }
+        }
+
+        message.setErrorDetected(errorDetectedInBlock); // True if *any* block had an error
+        // Assuming only 1-bit errors are simulated, they are always correctable by Hamming(7,4)
+        message.setErrorCorrected(errorDetectedInBlock); // Error detected implies corrected
+
+        return correctedBinary.toString();
+    }
+}
+
+--- src\main\java\com\somnath\common\Message.java ---
+package com.somnath.common;
+import java.io.Serializable;
+import java.util.Base64;
+
+public class Message implements Serializable {
+    private static final long serialVersionUID = 2L; // Increment serial version ID
+
+    private String sender;
+    private String recipient; // null for group message, username for private message
+    private String fullOriginalText; // The exact string typed by the user (e.g., "@Bob Hello")
+
+    // The actual content that gets encrypted/encoded
+    private String contentToEncrypt;
+
+    // States during processing
+    private String encryptedContentBase64; // Base64 of RSA encrypted bytes of contentToEncrypt
+    private String hammingEncodedBinary; // Binary string after Hamming encoding (client-side before error)
+    private String erroredHammingBinary; // Binary string after error simulation (what is sent)
+    private String correctedHammingBinary; // Binary string after Hamming correction (server-side)
+    private String finalDecryptedContent; // The final readable message body after server decryption
+
+    // Flags to indicate processing outcome
+    private boolean errorDetected = false;
+    private boolean errorCorrected = false;
+
+    // --- Constructor ---
+    // Client will typically create this object
+    public Message(String sender, String fullOriginalText, String recipient, String contentToEncrypt) {
+        this.sender = sender;
+        this.fullOriginalText = fullOriginalText;
+        this.recipient = recipient;
+        this.contentToEncrypt = contentToEncrypt;
+        // Other fields are set later during processing
+    }
+
+    // --- Getters (Needed by UI and Server) ---
+    public String getSender() { return sender; }
+    public String getRecipient() { return recipient; } // null for group
+    public String getFullOriginalText() { return fullOriginalText; } // What user typed
+    public String getContentToEncrypt() { return contentToEncrypt; } // Just the message body
+
+    public String getEncryptedContentBase64() { return encryptedContentBase64; }
+    public String getHammingEncodedBinary() { return hammingEncodedBinary; }
+    public String getErroredHammingBinary() { return erroredHammingBinary; }
+    public String getCorrectedHammingBinary() { return correctedHammingBinary; }
+    public String getFinalDecryptedContent() { return finalDecryptedContent; }
+
+    public boolean isPrivateMessage() { return recipient != null && !recipient.trim().isEmpty(); }
+    public boolean isErrorDetected() { return errorDetected; }
+    public boolean isErrorCorrected() { return errorCorrected; }
+
+    // --- Setters (Needed by Client/Server to populate) ---
+    // Client side populates:
+    public void setEncryptedContentBase64(String encryptedContentBase64) { this.encryptedContentBase64 = encryptedContentBase64; }
+    public void setHammingEncodedBinary(String hammingEncodedBinary) { this.hammingEncodedBinary = hammingEncodedBinary; }
+    public void setErroredHammingBinary(String erroredHammingBinary) { this.erroredHammingBinary = erroredHammingBinary; }
+
+    // Server side populates:
+    public void setCorrectedHammingBinary(String correctedHammingBinary) { this.correctedHammingBinary = correctedHammingBinary; }
+    public void setFinalDecryptedContent(String finalDecryptedContent) { this.finalDecryptedContent = finalDecryptedContent; }
+    public void setErrorDetected(boolean errorDetected) { this.errorDetected = errorDetected; }
+    public void setErrorCorrected(boolean errorCorrected) { this.errorCorrected = errorCorrected; }
+
+
+    @Override
+    public String toString() {
+        // Basic string for debugging logs
+        return "Message{" +
+                "sender='" + sender + '\'' +
+                ", recipient='" + (recipient == null ? "GROUP" : recipient) + '\'' +
+                ", finalDecryptedContent='" + finalDecryptedContent + '\'' +
+                ", errorDetected=" + errorDetected +
+                '}';
+    }
+}
+
+--- src\main\java\com\somnath\common\RSAUtil.java ---
+package com.somnath.common;
+
+
+import java.security.*;
+import javax.crypto.*;
+import java.util.Base64;
+
+public class RSAUtil {
+
+    private static final String ALGORITHM = "RSA";
+    // Choose a key size. 1024 or 2048 are common.
+    // Note: RSA encrypts data in blocks limited by the key size.
+    // For simplicity in this example, we assume message bytes fit within one block.
+    // For production, you'd use hybrid encryption (RSA for symmetric key).
+    private static final int KEY_SIZE = 1024; // 1024 bits
+
+    /**
+     * Generates a new RSA key pair.
+     * Server will use this.
+     * @return The generated KeyPair.
+     * @throws NoSuchAlgorithmException If RSA algorithm is not available.
+     */
+    public static KeyPair generateKeyPair() throws NoSuchAlgorithmException {
+        KeyPairGenerator keyGen = KeyPairGenerator.getInstance(ALGORITHM);
+        keyGen.initialize(KEY_SIZE);
+        return keyGen.generateKeyPair();
+    }
+
+    /**
+     * Encrypts data using a public key.
+     * Client will use this with server's public key.
+     * @param data The data to encrypt.
+     * @param publicKey The public key for encryption.
+     * @return The encrypted data bytes.
+     * @throws Exception If encryption fails.
+     */
+    public static byte[] encrypt(byte[] data, PublicKey publicKey) throws Exception {
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey);
+        // Handle chunking if data > block size. For simplicity, omitting here.
+        // Will throw exception if data is too large.
+        return cipher.doFinal(data);
+    }
+
+    /**
+     * Decrypts data using a private key.
+     * Server will use this with its private key.
+     * @param data The data to decrypt.
+     * @param privateKey The private key for decryption.
+     * @return The decrypted data bytes.
+     * @throws Exception If decryption fails.
+     */
+    public static byte[] decrypt(byte[] data, PrivateKey privateKey) throws Exception {
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.DECRYPT_MODE, privateKey);
+        // Handle chunking if data was encrypted in chunks. For simplicity, omitting here.
+        return cipher.doFinal(data);
+    }
+
+    /**
+     * Helper to convert byte array to Base64 String for transmission/display.
+     */
+    public static String bytesToBase64(byte[] bytes) {
+        return Base64.getEncoder().encodeToString(bytes);
+    }
+
+    /**
+     * Helper to convert Base64 String back to byte array.
+     */
+    public static byte[] base64ToBytes(String base64String) {
+        return Base64.getDecoder().decode(base64String);
+    }
+
+    /**
+     * Helper to convert String to byte array using UTF-8.
+     */
+    public static byte[] stringToBytes(String s) {
+        return s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Helper to convert byte array to String using UTF-8.
+     */
+    public static String bytesToString(byte[] bytes) {
+        return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+    }
+}
+
+--- src\main\java\com\somnath\server\Server.java ---
+package com.somnath.server;
+
+
+import com.somnath.common.Message;
+import com.somnath.common.RSAUtil;
+import com.somnath.common.HammingUtil;
+
+import javax.crypto.BadPaddingException;
+import java.io.*;
+import java.net.*;
+import java.security.*;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+public class Server {
+
+    private static final int PORT = 12345;
+    private ServerSocket serverSocket;
+    // Use a synchronized map to manage clients by username
+    private Map<String, ClientHandler> clientHandlers = Collections.synchronizedMap(new HashMap<>());
+    private KeyPair serverKeyPair;
+
+    public Server() {
+        try {
+            // 1. Generate Server's RSA Key Pair
+            serverKeyPair = RSAUtil.generateKeyPair();
+            System.out.println("Server RSA KeyPair generated.");
+
+            // 2. Start Server Socket
+            serverSocket = new ServerSocket(PORT);
+            System.out.println("Server started on port " + PORT);
+
+            // 3. Accept Connections
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                System.out.println("New client connecting: " + clientSocket);
+
+                // Create a handler for the client
+                ClientHandler handler = new ClientHandler(clientSocket, this);
+                handler.start();
+            }
+
+        } catch (NoSuchAlgorithmException e) {
+            System.err.println("RSA Algorithm not available: " + e.getMessage());
+            e.printStackTrace();
+        } catch (IOException e) {
+            System.err.println("Error starting server or accepting connection: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            // Close server socket on exit
+            try {
+                if (serverSocket != null && !serverSocket.isClosed()) {
+                    serverSocket.close();
+                }
+            } catch (IOException e) {
+                System.err.println("Error closing server socket: " + e.getMessage());
+            }
+        }
+    }
+
+    // Method to add a client handler to the map
+    public void addClient(String username, ClientHandler handler) {
+        clientHandlers.put(username, handler);
+        System.out.println("Client '" + username + "' connected. Active clients: " + clientHandlers.size());
+        // Optional: Notify all clients that a new user joined
+        broadcastStatusMessage("User '" + username + "' joined.");
+    }
+
+    // Method to remove a client handler when they disconnect
+    public void removeClient(String username) {
+        if (username != null) {
+            clientHandlers.remove(username);
+            System.out.println("Client '" + username + "' disconnected. Active clients: " + clientHandlers.size());
+            // Optional: Notify all clients that a user left
+            broadcastStatusMessage("User '" + username + "' left.");
+        }
+    }
+
+    // Broadcast a simple status message (not encrypted/encoded) - useful for join/leave
+    private void broadcastStatusMessage(String status) {
+        // Create a special message type if needed, or just log
+        // For now, just log server-side. Clients can infer joins/leaves from chat messages.
+        System.out.println("[STATUS] " + status);
+        // If you want clients to display this, create a separate "StatusMessage" object
+        // or add a 'type' field to Message and broadcast it.
+    }
+
+
+    // Method to route the processed message
+    public void routeMessage(Message msg, ClientHandler senderHandler) {
+        System.out.println("Routing message from " + msg.getSender() + " to " + (msg.isPrivateMessage() ? msg.getRecipient() : "GROUP"));
+
+        if (msg.isPrivateMessage()) {
+            // Private Message
+            ClientHandler recipientHandler = clientHandlers.get(msg.getRecipient());
+
+            // Send to sender (so they see their own message pipeline)
+            senderHandler.sendMessage(msg);
+
+            if (recipientHandler != null && recipientHandler != senderHandler) {
+                // Send to recipient
+                recipientHandler.sendMessage(msg);
+                System.out.println("Sent private message to '" + msg.getRecipient() + "'");
+            } else if (recipientHandler == senderHandler) {
+                System.out.println("Private message to self: Sent back to sender.");
+            }
+            else {
+                System.out.println("Private message recipient '" + msg.getRecipient() + "' not found.");
+                // Optional: Send a "User not found" message back to sender
+                // Requires creating and sending a special message type to senderHandler
+                senderHandler.sendMessage(createErrorMessage("User '" + msg.getRecipient() + "' not found.", "SERVER"));
+            }
+        } else {
+            // Group Message (Broadcast)
+            // Send to all clients, including the sender
+            for (ClientHandler handler : clientHandlers.values()) {
+                handler.sendMessage(msg);
+            }
+            System.out.println("Broadcast group message.");
+        }
+    }
+
+    // Helper to create a simple text message from the server for the client UI
+    private Message createErrorMessage(String text, String sender) {
+        // This is a simple message that doesn't go through crypto/hamming pipeline
+        Message errorMsg = new Message(sender, text, null, text);
+        errorMsg.setFinalDecryptedContent(text); // Set the final text directly
+        // Other fields can be left null
+        return errorMsg;
+    }
+
+
+    public PrivateKey getServerPrivateKey() {
+        return serverKeyPair.getPrivate();
+    }
+
+    public PublicKey getServerPublicKey() {
+        return serverKeyPair.getPublic();
+    }
+
+
+    // Inner class to handle individual client connections
+    class ClientHandler extends Thread {
+        private Socket clientSocket;
+        private Server server;
+        private ObjectInputStream inputStream;
+        private ObjectOutputStream outputStream;
+        private String username; // Added username field
+
+        public ClientHandler(Socket socket, Server server) {
+            this.clientSocket = socket;
+            this.server = server;
+        }
+
+        public String getUsername() {
+            return username;
+        }
+
+        public void run() {
+            try {
+                // Initialize streams (Output first to avoid deadlock)
+                outputStream = new ObjectOutputStream(clientSocket.getOutputStream());
+                inputStream = new ObjectInputStream(clientSocket.getInputStream());
+
+                // 1. Send Server's Public Key to the Client
+                outputStream.writeObject(server.getServerPublicKey());
+                outputStream.flush(); // Ensure key is sent immediately
+                System.out.println("Sent public key to client: " + clientSocket);
+
+                // 2. Receive Client's Username
+                // Assuming the client sends the username as a String object first
+                Object initialObject = inputStream.readObject();
+                if (initialObject instanceof String) {
+                    this.username = (String) initialObject;
+                    // Basic validation
+                    if (this.username == null || this.username.trim().isEmpty()) {
+                        System.err.println("Client provided empty username. Disconnecting: " + clientSocket);
+                        return; // Exit handler run method
+                    }
+                    this.username = this.username.trim(); // Trim whitespace
+                    System.out.println("Received username '" + this.username + "' from client: " + clientSocket);
+
+                    // Add client to the server's map
+                    if (server.clientHandlers.containsKey(this.username)) {
+                        // Username already exists. Deny connection or append suffix?
+                        // For now, deny and close connection.
+                        System.err.println("Username '" + this.username + "' already in use. Denying connection: " + clientSocket);
+                        sendMessage(createErrorMessage("Username '" + this.username + "' is already in use. Please try a different name.", "SERVER"));
+                        return; // Exit handler run method
+                    }
+                    server.addClient(this.username, this);
+
+                } else {
+                    System.err.println("First object from client was not a username String. Disconnecting: " + clientSocket);
+                    return; // Exit handler run method
+                }
+
+
+                // 3. Read Messages from Client
+                Message receivedMessage;
+                while (clientSocket.isConnected() && (receivedMessage = (Message) inputStream.readObject()) != null) {
+                    // The received message object contains sender, recipient, fullOriginalText,
+                    // contentToEncrypt (parsed client-side), encryptedContentBase64, erroredHammingBinary
+
+                    // --- Server-side Processing Pipeline ---
+
+                    // Step A: Hamming Correct
+                    String erroredBinary = receivedMessage.getErroredHammingBinary();
+                    String correctedBinary = HammingUtil.correctError(erroredBinary, receivedMessage);
+                    receivedMessage.setCorrectedHammingBinary(correctedBinary);
+                    // System.out.println("Hamming Corrected. Error Detected: " + receivedMessage.isErrorDetected()); // Too verbose
+
+
+                    // Step B: Hamming Decode
+                    String decodedBinary = HammingUtil.decode(correctedBinary);
+
+                    // Step C: Convert Binary String back to Encrypted Bytes
+                    byte[] encryptedBytes = HammingUtil.binaryStringToBytes(decodedBinary);
+
+                    // Step D: RSA Decrypt
+                    try {
+                        byte[] decryptedBytes = RSAUtil.decrypt(encryptedBytes, server.getServerPrivateKey());
+                        String finalDecryptedContent = RSAUtil.bytesToString(decryptedBytes);
+                        receivedMessage.setFinalDecryptedContent(finalDecryptedContent);
+                        // System.out.println("RSA Decrypted. Final Content: '" + finalDecryptedContent + "'"); // Too verbose
+
+
+                        // --- Server-side Routing ---
+                        server.routeMessage(receivedMessage, this); // Pass the message and the sender handler
+
+                    } catch (BadPaddingException e) {
+                        // This might happen if decryption fails (e.g., due to uncorrectable error or tampering)
+                        System.err.println("RSA Decryption failed (BadPaddingException) for message from " + receivedMessage.getSender() + ". Likely corrupt. " + e.getMessage());
+                        receivedMessage.setFinalDecryptedContent("[DECRYPTION FAILED]"); // Set error text
+                        // Route the message anyway so clients see the failure
+                        server.routeMessage(receivedMessage, this);
+                    } catch (Exception e) {
+                        // Other decryption errors
+                        System.err.println("RSA Decryption failed unexpectedly for message from " + receivedMessage.getSender() + ": " + e.getMessage());
+                        e.printStackTrace();
+                        receivedMessage.setFinalDecryptedContent("[DECRYPTION ERROR]"); // Set error text
+                        server.routeMessage(receivedMessage, this); // Route the message with error info
+                    }
+                }
+
+            } catch (SocketException e) {
+                System.out.println("Client '" + username + "' disconnected (SocketException).");
+            } catch (EOFException e) {
+                System.out.println("Client '" + username + "' disconnected (EOFException).");
+            } catch (IOException e) {
+                System.err.println("IO error with client '" + username + "': " + e.getMessage());
+                e.printStackTrace();
+            } catch (ClassNotFoundException e) {
+                System.err.println("Received unknown object from client '" + username + "': " + e.getMessage());
+                e.printStackTrace();
+            } finally {
+                // Clean up
+                try {
+                    if (inputStream != null) inputStream.close();
+                    if (outputStream != null) outputStream.close();
+                    if (clientSocket != null && !clientSocket.isClosed()) clientSocket.close();
+                } catch (IOException e) {
+                    System.err.println("Error closing client socket/streams for '" + username + "': " + e.getMessage());
+                }
+                server.removeClient(this.username); // Remove this handler from the server's map
+            }
+        }
+
+        // Method for server to send a message object to this specific client
+        public void sendMessage(Message msg) {
+            try {
+                if (outputStream != null) {
+                    outputStream.writeObject(msg);
+                    outputStream.flush();
+                    // System.out.println("Sent message object to client '" + username + "'."); // Too verbose
+                }
+            } catch (IOException e) {
+                System.err.println("Error sending message to client '" + username + "': " + e.getMessage());
+                // Consider removing client if sending fails consistently
+                // server.removeClient(this.username); // Or handle appropriately
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        new Server(); // Start the server
+    }
+}
+
+--- src\main\java\com\somnath\ui\ChatController.java ---
+package com.somnath.ui;
+
+// ui/ChatController.java
+
+import com.somnath.common.Message;
+import com.somnath.client.Client;
+
+import javafx.application.Platform;
+import javafx.fxml.FXML;
+import javafx.fxml.Initializable;
+import javafx.geometry.Insets;
+import javafx.geometry.Pos;
+import javafx.scene.control.*;
+import javafx.scene.layout.VBox;
+import javafx.scene.paint.Color;
+import javafx.scene.text.Font;
+import javafx.scene.text.FontWeight;
+import javafx.scene.text.Text;
+import javafx.scene.text.TextFlow;
+import javafx.stage.Stage;
+
+import java.net.URL;
+import java.util.ResourceBundle;
+
+public class ChatController implements Initializable {
+
+    @FXML private ListView<Message> messageListView;
+    @FXML private TextField messageTextField;
+    @FXML private Button sendButton;
+    @FXML private Label statusLabel;
+
+    public Client client; // Make client public or provide getter if needed for AppLauncher
+    private String username;
+
+    // --- Initialization ---
+    @Override
+    public void initialize(URL url, ResourceBundle rb) {
+        // Prompt for username first
+        getUsernameFromUser();
+
+        // Configure the ListView to use a custom cell factory
+        messageListView.setCellFactory(listView -> new MessageCell());
+
+        // Set up action for sending message (Enter key or Button click)
+        messageTextField.setOnAction(event -> sendMessage()); // Enter key
+        sendButton.setOnAction(event -> sendMessage());    // Button click
+
+        // Make sure the text field is disabled until connected
+        messageTextField.setDisable(true);
+        sendButton.setDisable(true);
+
+        // Start the client connection attempt after getting username
+        if (this.username != null && !this.username.trim().isEmpty()) {
+            startClientConnection("localhost", 12345);
+        } else {
+            displayStatus("Connection cancelled: No username provided.", Color.RED);
+        }
+    }
+
+    // --- Get Username Dialog ---
+    private void getUsernameFromUser() {
+        TextInputDialog dialog = new TextInputDialog("User" + (int)(Math.random() * 1000)); // Default with random suffix
+        dialog.setTitle("Username");
+        dialog.setHeaderText("Enter your username");
+        dialog.setContentText("Username:");
+        dialog.setGraphic(null); // Remove default icon
+
+        Stage dialogStage = (Stage) dialog.getDialogPane().getScene().getWindow();
+        dialogStage.setOnCloseRequest(event -> {
+            // If user closes dialog without entering name, exit application
+            if (this.username == null || this.username.trim().isEmpty()) {
+                Platform.exit();
+                System.exit(0);
+            }
+        });
+
+
+        dialog.showAndWait().ifPresent(name -> this.username = name.trim());
+
+        // Ensure username is not empty if dialog was just closed
+        if (this.username != null && this.username.isEmpty()) {
+            this.username = null; // Treat empty as cancelled
+        }
+    }
+
+
+    // --- Client Connection Management ---
+    private void startClientConnection(String host, int port) {
+        // It's better to run the client connection in a separate thread
+        new Thread(() -> {
+            client = new Client(host, port, username, this); // Pass 'this' controller
+            client.startClient(); // This method blocks until connected or fails
+            // After startClient returns, check connection status and update UI
+            Platform.runLater(() -> {
+                // Check if socket exists and is connected
+                if (client != null && client.socket != null && client.socket.isConnected()) {
+                    // The server also validates and adds the user.
+                    // A more robust app would wait for server confirmation here.
+                    // For now, assume successful socket connection means username was likely accepted.
+                    // The server sends error message if username is taken, which will appear in displayMessage.
+                    displayStatus("Attempting connection as '" + username + "'...", Color.ORANGE); // Initial status
+
+                    // UI elements enabled when socket connects, actual chat depends on server username acceptance
+                    messageTextField.setDisable(false);
+                    sendButton.setDisable(false);
+                    messageTextField.requestFocus(); // Set focus to input field
+                } else {
+                    // Client.startClient() failed
+                    displayStatus("Connection failed during setup.", Color.RED);
+                    messageTextField.setDisable(true);
+                    sendButton.setDisable(true);
+                }
+            });
+        }).start();
+    }
+
+
+    // --- Sending Message ---
+    private void sendMessage() {
+        String text = messageTextField.getText();
+        if (text == null || text.trim().isEmpty()) {
+            return; // Don't send empty messages
+        }
+
+        // The client class now handles parsing the @username syntax internally
+        if (client != null && client.socket != null && client.socket.isConnected()) {
+            // Pass the full typed text to the client layer
+            client.sendMessage(text.trim());
+            messageTextField.clear(); // Clear input field
+        } else {
+            displayStatus("Error: Not connected to server.", Color.RED);
+            // Maybe attempt to reconnect or prompt user?
+        }
+    }
+
+    // --- Receiving and Displaying Messages (Called by Client Thread) ---
+    public void displayMessage(Message msg) {
+        // Ensure UI updates happen on the JavaFX Application Thread
+        Platform.runLater(() -> {
+            // Check if this is a server error message about username taken
+            if ("SERVER".equals(msg.getSender()) && msg.getFinalDecryptedContent() != null && msg.getFinalDecryptedContent().contains("Username")) {
+                displayStatus(msg.getFinalDecryptedContent(), Color.RED);
+                // If username taken, disconnect the client
+                if (client != null) {
+                    client.closeClient(); // This will trigger the finally block in client handler
+                    messageTextField.setDisable(true);
+                    sendButton.setDisable(true);
+                }
+            } else {
+                // Add regular message to the list view
+                messageListView.getItems().add(msg);
+                // Auto-scroll to the bottom
+                messageListView.scrollTo(messageListView.getItems().size() - 1);
+
+                // Update status if it was a successful connection message
+                if (client != null && client.socket != null && client.socket.isConnected() && "Attempting connection as".equals(statusLabel.getText().replace("Status: ", "").split("'")[0])) {
+                    displayStatus("Connected as '" + username + "'", Color.GREEN);
+                }
+
+                // If the message is from the server and indicates a join/leave
+                if ("SERVER".equals(msg.getSender())) {
+                    // Optional: Handle server status messages differently
+                    // For now, they just appear in the chat list.
+                }
+            }
+        });
+    }
+
+    // --- Update Status Label (Called by Client Thread) ---
+    public void displayStatus(String status) {
+        displayStatus(status, Color.BLACK); // Default color
+    }
+
+    public void displayStatus(String status, Color color) {
+        Platform.runLater(() -> {
+            statusLabel.setText("Status: " + status);
+            statusLabel.setTextFill(color);
+        });
+    }
+
+
+    // --- Custom ListCell for Message Display ---
+    // This defines how each Message object is rendered in the ListView
+    class MessageCell extends ListCell<Message> {
+        private final VBox contentBox = new VBox(5);
+        private final Label senderInfoLabel = new Label(); // Will show Sender [to Recipient]
+        private final TextFlow fullOriginalTextFlow = new TextFlow();
+        private final TextFlow encryptedContentFlow = new TextFlow();
+        private final TextFlow erroredHammingFlow = new TextFlow();
+        private final TextFlow correctedHammingFlow = new TextFlow();
+        private final TextFlow finalDecryptedContentFlow = new TextFlow();
+        private final Label errorStatusLabel = new Label();
+
+
+        public MessageCell() {
+            contentBox.setPadding(new Insets(5));
+
+            // Sender/Recipient Info Label
+            senderInfoLabel.setFont(Font.font("System", FontWeight.BOLD, 12));
+
+            // Add components to the content box
+            contentBox.getChildren().addAll(
+                    senderInfoLabel,
+                    createSection("Original Typed:", fullOriginalTextFlow),
+                    createSection("Encrypted Content (Base64):", encryptedContentFlow),
+                    createSection("Hamming Errored:", erroredHammingFlow),
+                    createSection("Hamming Corrected:", correctedHammingFlow),
+                    createSection("Final Decrypted:", finalDecryptedContentFlow),
+                    errorStatusLabel
+            );
+
+            // Add padding to the overall cell content
+            setPadding(new Insets(5));
+
+            // Allow the cell to grow/shrink with content
+            setPrefWidth(0); // Necessary for wrapping to work properly inside ListView
+        }
+
+        // Helper to create a labeled section
+        private VBox createSection(String label, TextFlow textFlow) {
+            Label sectionLabel = new Label(label);
+            sectionLabel.setFont(Font.font("System", FontWeight.BOLD, 10));
+            VBox sectionBox = new VBox(2);
+            sectionBox.getChildren().addAll(sectionLabel, textFlow);
+            return sectionBox;
+        }
+
+
+        @Override
+        protected void updateItem(Message msg, boolean empty) {
+            super.updateItem(msg, empty);
+
+            if (empty || msg == null) {
+                setGraphic(null);
+            } else {
+                // Populate the cell's components with data from the Message object
+
+                // Sender/Recipient Info
+                if (msg.isPrivateMessage()) {
+                    senderInfoLabel.setText(msg.getSender() + " [to " + msg.getRecipient() + "]");
+                    senderInfoLabel.setTextFill(Color.DARKBLUE); // Different color for private
+                } else {
+                    senderInfoLabel.setText(msg.getSender());
+                    senderInfoLabel.setTextFill(Color.BLACK); // Default color for group
+                }
+
+                // Full Original Text (what the user typed)
+                fullOriginalTextFlow.getChildren().clear();
+                fullOriginalTextFlow.getChildren().add(new Text(msg.getFullOriginalText() != null ? msg.getFullOriginalText() : "N/A"));
+
+                // Encrypted Content (Base64)
+                encryptedContentFlow.getChildren().clear();
+                encryptedContentFlow.getChildren().add(new Text(msg.getEncryptedContentBase64() != null ? msg.getEncryptedContentBase64() : "N/A"));
+
+                // Hamming Errored Binary
+                erroredHammingFlow.getChildren().clear();
+                erroredHammingFlow.getChildren().add(new Text(msg.getErroredHammingBinary() != null ? msg.getErroredHammingBinary() : "N/A"));
+
+                // Hamming Corrected Binary
+                correctedHammingFlow.getChildren().clear();
+                correctedHammingFlow.getChildren().add(new Text(msg.getCorrectedHammingBinary() != null ? msg.getCorrectedHammingBinary() : "N/A"));
+
+
+                // Final Decrypted Content
+                finalDecryptedContentFlow.getChildren().clear();
+                // Handle potential decryption failures visually
+                String decryptedText = msg.getFinalDecryptedContent() != null ? msg.getFinalDecryptedContent() : "N/A";
+                Text decryptedTextNode = new Text(decryptedText);
+                if (decryptedText.startsWith("[DECRYPTION FAILED]") || decryptedText.startsWith("[DECRYPTION ERROR]")) {
+                    decryptedTextNode.setFill(Color.RED);
+                }
+                finalDecryptedContentFlow.getChildren().add(decryptedTextNode);
+
+
+                // Error Status
+                if (msg.isErrorDetected()) {
+                    errorStatusLabel.setText("Hamming Error: Detected and Corrected");
+                    errorStatusLabel.setTextFill(Color.ORANGE);
+                } else {
+                    // Only show this label if Hamming processing happened
+                    if (msg.getErroredHammingBinary() != null) { // Implies processing happened
+                        errorStatusLabel.setText("Hamming Error: None Detected");
+                        errorStatusLabel.setTextFill(Color.GREEN);
+                    } else {
+                        errorStatusLabel.setText(""); // Hide label
+                    }
+                }
+
+
+                // Set the graphic of the cell to our custom VBox
+                setGraphic(contentBox);
+            }
+        }
+    }
+
+    // --- Application Entry Point ---
+    // This will be in AppLauncher.java
+    /*
+    public static void main(String[] args) {
+        launch(args);
+    }
+    */
+}
+
+--- src\main\resources\com\somnath\main\ui\ChatWindow.fxml ---
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+<?import javafx.scene.text.Font?>
+<?import javafx.scene.control.cell.ComboBoxListCell?>
+
+
+<VBox alignment="CENTER" spacing="10.0" xmlns="http://javafx.com/javafx/17" xmlns:fx="http://javafx.com/fxml/1" fx:controller="com.somnath.ui.ChatController">
+    <padding>
+        <Insets bottom="20.0" left="20.0" right="20.0" top="20.0" />
+    </padding>
+
+    <Label text="Encrypted Chat with Hamming" wrapText="true" textAlignment="CENTER">
+        <font>
+            <Font name="System Bold" size="18.0" />
+        </font>
+    </Label>
+
+    <!-- Status Label -->
+    <Label fx:id="statusLabel" text="Status: Not Connected" textFill="#65ff19"/>
+
+    <!-- Message Display Area -->
+    <!-- ListView to show messages, will use a custom cell factory -->
+    <ListView fx:id="messageListView" VBox.vgrow="ALWAYS">
+    </ListView>
+
+    <!-- Input Area -->
+    <HBox spacing="5.0">
+        <TextField fx:id="messageTextField" HBox.hgrow="ALWAYS" promptText="Enter message..."/>
+        <Button fx:id="sendButton" text="Send"/>
+    </HBox>
+
+</VBox>
