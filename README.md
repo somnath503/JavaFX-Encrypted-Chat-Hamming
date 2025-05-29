@@ -71,8 +71,3 @@ To send a private message, use: bash Copy Edit
 -Error Correction Steps
 -Final Decrypted Message
 
-📷 Screenshots
-Screenshots of the UI and message details can be found in the screenshots/ folder.
-
-![Chat Window](screenshorts/Screenshot 2025-05-29 131804.png)
-
